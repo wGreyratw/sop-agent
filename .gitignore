@@ -1,0 +1,21 @@
+# 密钥：只放在本地，不进入 git
+.env
+
+# 虚拟环境、缓存和构建产物
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# 外部评测工具：单独下载，版本记在文档里
+vendor/
+
+# 运行结果：可能很大，也可能包含模型输出
+outputs/
+
+# 系统和编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

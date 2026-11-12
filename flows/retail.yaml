@@ -1,0 +1,75 @@
+# 零售客服流程，依据 τ²-bench retail 领域的 policy.md 编写（tau2-bench c06b07d）。
+# 和 telecom.yaml 是不同的流程形状：这里是“请求清单”，一通电话里的多个请求逐个办理，
+# 每个请求都要：找到订单 → 查状态 → 收集细节 → 列出细节请顾客明确确认（yes）→ 执行。
+# 指令会直接给模型看，所以用英文。
+kind: requests
+name: retail_customer_service
+
+# 这些工具成功返回即视为已核实身份（policy：即使顾客给了 user id 也要查）
+identify_tools: [find_user_id_by_email, find_user_id_by_name_zip]
+identify: "Authenticate the customer first: find their user id with find_user_id_by_email, or with find_user_id_by_name_zip (first name, last name, zip). This is required even if they already gave a user id. Do nothing else before that."
+
+# 提取规则复杂，开着思考时一次提取会想上万 token（JSON 本身只有几百），费用是电信的两倍多
+extract_thinking: false
+
+escalate: "Transfer now: call transfer_to_human_agents with a short summary, then send exactly 'YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.'"
+
+# 顺序即办理优先级。同一个待发货订单上，改商品之后订单就不能再改或取消，所以 modify_order_items 排在其他修改之后。
+request_types:
+  information:
+    description: "A question that only needs looking up: order status, tracking number, item details, prices, profile or payment info."
+    needs_order: false
+    details: "Do not make up anything that the tools did not return."
+
+  cancel_order:
+    description: "Cancel a whole order that has not shipped."
+    allowed_status: [pending]
+    write_tool: cancel_pending_order
+    details: "the order id and the reason, which must be exactly 'no longer needed' or 'ordered by mistake' (no other reason is accepted)."
+
+  modify_order_address:
+    description: "Change the shipping address of an order that has not shipped."
+    allowed_status: [pending]
+    write_tool: modify_pending_order_address
+    details: "the complete new shipping address (it may come from the profile or another order if the customer says so)."
+
+  modify_order_payment:
+    description: "Change the payment method of an order that has not shipped."
+    allowed_status: [pending]
+    write_tool: modify_pending_order_payment
+    details: "a single payment method different from the original one; a gift card must have enough balance for the total."
+
+  modify_order_items:
+    description: "Change items of an order that has not shipped to other options of the same product (size, color, ...)."
+    allowed_status: [pending]
+    switch_on_status: {delivered: exchange_items}
+    write_tool: modify_pending_order_items
+    once_per_order: true
+    # 试过“改商品前先问要不要改地址或付款方式”（针对训练集 104），结果在 72 上引出了顾客没要的付款方式修改，已撤回
+    details: "ALL items to change in this order (remind the customer this can be done only once, so they must list every item now), for each a new item id that is an available option of the same product, and a payment method for the price difference (a gift card needs enough balance)."
+
+  return_items:
+    description: "Return items of a delivered order for a refund."
+    allowed_status: [delivered]
+    write_tool: return_delivered_order_items
+    details: "the list of item ids to return and the refund method, which must be the original payment method or an existing gift card."
+
+  exchange_items:
+    description: "Exchange items of a delivered order for other options of the same product."
+    allowed_status: [delivered]
+    # 顾客常把未发货订单的改款也说成“换货”，按订单状态纠正
+    switch_on_status: {pending: modify_order_items}
+    write_tool: exchange_delivered_order_items
+    once_per_order: true
+    details: "ALL items to exchange in this order (remind the customer this can be done only once, so they must list every item now), for each a new item id that is an available option of the same product, and a payment method for the price difference (a gift card needs enough balance)."
+
+  modify_user_address:
+    description: "Change the customer's default address in their profile."
+    needs_order: false
+    write_tool: modify_user_address
+    details: "the complete new address."
+
+  needs_human:
+    description: "Only if the customer explicitly asks for a human agent, or wants something no tool can do at all (e.g. undo a cancellation)."
+    needs_order: false
+    escalate: true

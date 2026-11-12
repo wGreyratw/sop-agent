@@ -1,0 +1,26 @@
+[project]
+name = "sop-agent"
+version = "0.1.0"
+description = "让客服 Agent 按标准作业流程（SOP）稳定执行的可控引擎，在 τ²-bench 上评测"
+requires-python = ">=3.12,<3.14"
+# tau2 不在 PyPI 上，从 vendor/tau2-bench 以可编辑方式安装（版本见 docs/DESIGN.md）
+dependencies = [
+    "langgraph>=1.0,<2",
+    "pydantic>=2",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+demo = ["streamlit>=1.40"]
+mcp = ["mcp>=2.3,<3"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

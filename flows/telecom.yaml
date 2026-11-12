@@ -1,0 +1,227 @@
+# 电信技术支持流程，依据 τ²-bench 的 tech_support_workflow.md 和 main_policy.md 编写。
+# 注释中的“Step x.y”对应 workflow 原文的步骤编号，方便逐条核对。
+# 指令（check / fix / check_symptom）会直接给模型看，所以用英文，和对话语言一致。
+name: telecom_tech_support
+
+# 允许转人工时的指令。回归：Agent 只问顾客“要不要转人工”而没有调用工具，顾客随即结束了对话
+escalate: "Transfer now: call transfer_to_human_agents with a short summary, then send exactly 'YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.' Do not ask the customer whether they want to be transferred."
+
+# Agent 自己调用的修复工具。调用成功后必须请顾客重新测试。
+# 回归：Agent 开通漫游后没有让顾客重测网速，直接转了人工
+fix_tools: [enable_roaming, refuel_data, resume_line]
+
+facts:
+  customer_identified:
+    description: Whether the customer has been located with a lookup tool.
+    values: ["yes", "no"]
+    source: agent
+  problem:
+    description: "The customer's main issue: no_service (no signal / No Service), mobile_data (no internet or slow data), or mms (cannot send picture messages)."
+    values: [no_service, mobile_data, mms]
+    source: user
+  service_available:
+    description: Whether the status bar shows cellular service (not 'no signal' and not airplane mode).
+    values: ["yes", "no"]
+    source: user
+  airplane_mode:
+    description: Airplane Mode on the phone.
+    values: ["on", "off"]
+    source: user
+  sim_status:
+    description: SIM card status reported by Check SIM Status.
+    values: [active, missing, locked]
+    source: user
+  apn_reset_done:
+    description: Whether the user has reset APN settings to default and rebooted the phone during this call.
+    values: ["yes", "no"]
+    source: user
+  line_suspension:
+    # 回归：线路同时有欠费和合同到期，被记成 overdue_bill，Agent 走了缴费恢复流程；
+    # 店规规定合同到期后即使缴清欠费也不能恢复，所以 contract_end 优先
+    description: "Suspension of the customer's line: none (the line is active), contract_end (suspended and its contract end date is in the past; use this even if there is also an overdue bill, because the policy forbids lifting it), or overdue_bill (suspended because of an overdue bill and the contract has not ended)."
+    values: [none, overdue_bill, contract_end]
+    source: agent
+  speed_test:
+    # 回归：顾客说“0.00 Mbps，基本没网”，被提取成 no_connection；实际测速结果是 Very Poor，已经连上了
+    description: "Latest speed test result. Use no_connection only when the test reports no connection or fails to connect. Any reported speed, even 0.00 Mbps, means the phone is connected: map it to its rating (very_poor, poor, fair, good or excellent), and use very_poor if only a near-zero number is given."
+    values: [no_connection, very_poor, poor, fair, good, excellent]
+    source: user
+  traveling:
+    description: Whether the user is currently outside their usual service area (abroad).
+    values: ["yes", "no"]
+    source: user
+  device_roaming:
+    description: Data Roaming setting on the phone.
+    values: ["on", "off"]
+    source: user
+  line_roaming:
+    description: Whether roaming is enabled on the customer's line in the account system.
+    values: [enabled, disabled]
+    source: agent
+  mobile_data:
+    description: Mobile Data setting on the phone.
+    values: ["on", "off"]
+    source: user
+  data_usage:
+    description: "Whether the line's data usage exceeds its plan limit. within_limit also covers the case where refueled data now covers the usage. refuel_declined means usage is exceeded and the user refused both refueling and a plan change."
+    values: [within_limit, exceeded, refuel_declined]
+    source: agent
+  data_saver:
+    description: Data Saver mode on the phone.
+    values: ["on", "off"]
+    source: user
+  network_mode:
+    description: "Highest network type in the phone's network mode preference (e.g. '4G/3G/2G' -> 4g)."
+    values: [5g, 4g, 3g, 2g]
+    source: user
+  vpn:
+    description: Whether a VPN is active on the phone.
+    values: ["on", "off"]
+    source: user
+  mms_works:
+    description: Whether the default messaging app can send an MMS message.
+    values: ["yes", "no"]
+    source: user
+  wifi_calling:
+    description: Wi-Fi Calling setting on the phone.
+    values: ["on", "off"]
+    source: user
+  messaging_permissions:
+    description: Whether the default messaging app has BOTH storage and SMS permissions.
+    values: [granted, missing]
+    source: user
+  mmsc_url:
+    description: Whether the APN settings contain an MMSC URL.
+    values: [present, missing]
+    source: user
+
+intake:
+  - id: identify_customer
+    fact: customer_identified
+    ok: ["yes"]
+    check: "Identify the customer first: look them up by phone number, customer ID, or full name with date of birth."
+    fix: "The lookup failed. Ask the customer for another identifier (phone number, customer ID, or full name with date of birth) and try again."
+  - id: classify_problem
+    fact: problem
+    ok: [no_service, mobile_data, mms]
+    check: "Ask the customer to describe the issue so you can tell whether it is no service, mobile data (no internet or slow), or picture messaging (MMS)."
+
+problem_fact: problem
+problems:
+  # 多个问题时先处理基本连接（原文 Initial Problem Classification）
+  no_service: [service]
+  mobile_data: [service, data_connectivity, data_speed]   # Step 2.1.1 先走 Path 1；连上后若不是 Excellent 再走 Path 2.2
+  mms: [service, data_connectivity, mms]                   # Step 3.1 先走 Path 1，Step 3.2 再走 Path 2.1（只看连通，不看速度）
+
+paths:
+  service:   # Path 1
+    title: No service
+    symptom: service_available
+    symptom_ok: ["yes"]
+    check_symptom: "Ask the user to check their status bar and tell you whether it shows cellular service."   # Step 1.0
+    items:
+      - id: airplane_mode   # Step 1.1
+        fact: airplane_mode
+        ok: ["off"]
+        check: "Ask the user to check their network status to see whether Airplane Mode is on."
+        fix: "Ask the user to turn Airplane Mode OFF, then check whether service is restored."
+      - id: sim_card   # Step 1.2
+        fact: sim_status
+        ok: [active]
+        check: "Ask the user to check their SIM status (active, missing, or locked)."
+        fix: "Ask the user to re-seat the SIM card (remove and re-insert it), then check that the SIM is active and whether service is restored."
+        escalate_if: [locked]
+      - id: reset_apn   # Step 1.3：没有可检查的状态，必须执行一次
+        fact: apn_reset_done
+        ok: ["yes"]
+        fix: "Ask the user to reset APN settings to default and then reboot the phone, and check whether service is restored."
+      - id: line_suspension   # Step 1.4，处理方式见 main policy 的 Line Suspension / Overdue Bill Payment
+        fact: line_suspension
+        ok: [none]
+        check: "Check the status of the line whose phone number is the one the customer reported (a customer can have several lines; find the matching line with get_details_by_id before relying on it). If it is suspended, find out why: check the customer's bills for an overdue bill, and check the line's contract end date."
+        fix: "The line is suspended for an overdue bill. Follow the main policy: confirm the bill is overdue, send a payment request, let the user accept it, make the payment, confirm the bill is PAID, then resume the line and ask the user to reboot and check service."
+        escalate_if: [contract_end]
+
+  data_connectivity:   # Path 2.1
+    title: Mobile data unavailable
+    symptom: speed_test
+    symptom_ok: [very_poor, poor, fair, good, excellent]
+    check_symptom: "Ask the user to run a speed test and tell you the result (or 'no connection')."   # Step 2.1.0
+    items:
+      - id: traveling   # Step 2.1.2
+        fact: traveling
+        ok: ["yes", "no"]
+        check: "Ask the user whether they are currently outside their usual service area (for example, traveling abroad)."
+      - id: device_roaming
+        fact: device_roaming
+        ok: ["on"]
+        when: {traveling: ["yes"]}
+        check: "Ask the user to check whether Data Roaming is enabled on the phone."
+        fix: "Ask the user to turn Data Roaming ON, then rerun the speed test."
+      - id: line_roaming
+        fact: line_roaming
+        ok: [enabled]
+        when: {traveling: ["yes"]}
+        check: "Check with get_details_by_id whether roaming is enabled on the line whose phone number is the one the customer reported."
+        fix: "Enable roaming at no cost (enable_roaming) on the line whose phone number is the one the customer reported, then ask the user to rerun the speed test."
+      - id: mobile_data   # Step 2.1.3
+        fact: mobile_data
+        ok: ["on"]
+        check: "Ask the user to check whether Mobile Data is turned on."
+        fix: "Ask the user to turn Mobile Data ON, then rerun the speed test."
+      - id: data_usage   # Step 2.1.4
+        fact: data_usage
+        ok: [within_limit]
+        # 回归：Agent 查了顾客另一条线路的用量，以为没超就转了人工
+        check: "Check data usage against the plan limit with get_data_usage, on the line whose phone number is the one the customer reported. A customer can have several lines; confirm the line ID with get_details_by_id first if you have not."
+        fix: "The data limit is exceeded on that line. Ask the user whether they want to refuel data (at most 2 GB, ask how much) or change to a plan with a higher limit. Confirm the price before applying it to that line, then ask the user to rerun the speed test."
+        escalate_if: [refuel_declined]
+
+  data_speed:   # Path 2.2
+    title: Slow mobile data
+    symptom: speed_test
+    symptom_ok: [excellent]
+    check_symptom: "Ask the user to run a speed test and tell you the result."   # Step 2.2.0
+    items:
+      - id: data_saver   # Step 2.2.1
+        fact: data_saver
+        ok: ["off"]
+        check: "Ask the user to check their data restrictions, such as Data Saver mode."
+        fix: "Ask the user to turn Data Saver OFF, then rerun the speed test."
+      - id: network_mode_speed   # Step 2.2.2
+        fact: network_mode
+        ok: [5g, 4g]
+        check: "Ask the user to check their network mode preference."
+        fix: "Ask the user to change the network mode preference to an option that includes 5G, then rerun the speed test."
+      - id: vpn   # Step 2.2.3
+        fact: vpn
+        ok: ["off"]
+        check: "Ask the user to check whether a VPN is active."
+        fix: "Ask the user to disconnect the VPN, then rerun the speed test."
+
+  mms:   # Path 3
+    title: Picture messaging (MMS)
+    symptom: mms_works
+    symptom_ok: ["yes"]
+    check_symptom: "Ask the user to try sending an MMS with the default messaging app and tell you whether it works."   # Step 3.0
+    items:
+      - id: network_mode_mms   # Step 3.3：彩信至少需要 3G
+        fact: network_mode
+        ok: [5g, 4g, 3g]
+        check: "Ask the user to check their network mode preference."
+        fix: "Ask the user to change the network mode to include at least 3G/4G/5G, then try sending an MMS again."
+      - id: wifi_calling   # Step 3.4
+        fact: wifi_calling
+        ok: ["off"]
+        check: "Ask the user to check whether Wi-Fi Calling is enabled."
+        fix: "Ask the user to turn Wi-Fi Calling OFF, then try sending an MMS again."
+      - id: messaging_permissions   # Step 3.5
+        fact: messaging_permissions
+        ok: [granted]
+        check: "Ask the user to check the default messaging app's permissions (both storage and SMS are required)."
+        fix: "Ask the user to grant both storage and SMS permissions to the messaging app, then try sending an MMS again."
+      - id: mmsc_url   # Step 3.6
+        fact: mmsc_url
+        ok: [present]
+        check: "Ask the user to check their APN settings, specifically whether an MMSC URL is configured."
+        fix: "Ask the user to reset APN settings to carrier defaults, then try sending an MMS again."
